@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"slices"
 	"strconv"
 	"time"
 
@@ -33,6 +32,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/hashicorp/terraform-provider-aws/internal/errs/fwdiag"
 	"github.com/hashicorp/terraform-provider-aws/internal/framework"
@@ -461,7 +461,7 @@ func (r *bucketLifecycleConfigurationResource) Read(ctx context.Context, request
 			return tfresource.NonRetryableError(err)
 		}
 
-		if lastOutput == nil || !lifecycleConfigEqual(lastOutput.TransitionDefaultMinimumObjectSize, lastOutput.Rules, output.TransitionDefaultMinimumObjectSize, output.Rules) {
+		if lastOutput == nil || !lifecycleConfigEqual(ctx, lastOutput.TransitionDefaultMinimumObjectSize, lastOutput.Rules, output.TransitionDefaultMinimumObjectSize, output.Rules) {
 			lastOutput = output
 			return tfresource.RetryableError(fmt.Errorf("S3 Bucket Lifecycle Configuration (%s) has not stablized; retrying", bucket))
 		}
@@ -627,6 +627,14 @@ func findBucketLifecycleConfiguration(ctx context.Context, conn *s3.Client, buck
 		}
 	}
 
+	if err != nil {
+		return nil, err
+	}
+
+	if output == nil || len(output.Rules) == 0 {
+		return nil, tfresource.NewEmptyResultError(input)
+	}
+
 	// For legacy-mode reasons, we normalize empty `prefix` is nil when making requests to S3 and storing internal state.
 	// Some S3 compatible services might return empty string as an equivalent representation. To maintain a consistent state we should normalize that back to nil.
 	for i := range output.Rules {
@@ -636,36 +644,188 @@ func findBucketLifecycleConfiguration(ctx context.Context, conn *s3.Client, buck
 			//nolint:staticcheck // Yes the attribute Prefix is deprecated, but the following functionality is required for compatibility with non AWS systems
 			(*rule).Prefix = nil
 		}
-	}
 
-	if err != nil {
-		return nil, err
-	}
-
-	if output == nil || len(output.Rules) == 0 {
-		return nil, tfresource.NewEmptyResultError(input)
+		// Normalize empty Filter to nil for Ceph RGW compatibility.
+		// Ceph returns <Prefix></Prefix> which SDK parses into an empty Filter struct.
+		if rule.Filter != nil {
+			if rule.Filter.And == nil &&
+				rule.Filter.ObjectSizeGreaterThan == nil &&
+				rule.Filter.ObjectSizeLessThan == nil &&
+				rule.Filter.Prefix == nil &&
+				rule.Filter.Tag == nil {
+				rule.Filter = nil
+			}
+		}
 	}
 
 	return output, nil
 }
 
-func lifecycleConfigEqual(transitionMinSize1 awstypes.TransitionDefaultMinimumObjectSize, rules1 []awstypes.LifecycleRule, transitionMinSize2 awstypes.TransitionDefaultMinimumObjectSize, rules2 []awstypes.LifecycleRule) bool {
+func lifecycleConfigEqual(ctx context.Context, transitionMinSize1 awstypes.TransitionDefaultMinimumObjectSize, rules1 []awstypes.LifecycleRule, transitionMinSize2 awstypes.TransitionDefaultMinimumObjectSize, rules2 []awstypes.LifecycleRule) bool {
+	tflog.Debug(ctx, "rules1 (from server), rules2 (expected)")
+
+	// Normalize empty Filter structs to nil for both rule sets (Ceph RGW compatibility)
+	normalizeEmptyFilters := func(rules []awstypes.LifecycleRule) {
+		for i := range rules {
+			if rules[i].Filter != nil {
+				f := rules[i].Filter
+				if f.And == nil && f.ObjectSizeGreaterThan == nil && f.ObjectSizeLessThan == nil && f.Prefix == nil && f.Tag == nil {
+					rules[i].Filter = nil
+				}
+			}
+		}
+	}
+	normalizeEmptyFilters(rules1)
+	normalizeEmptyFilters(rules2)
+
+	tflog.Debug(ctx, "Comparing lifecycle configurations", map[string]any{
+		"rules1_count":       len(rules1),
+		"rules2_count":       len(rules2),
+		"transitionMinSize1": string(transitionMinSize1),
+		"transitionMinSize2": string(transitionMinSize2),
+	})
+
 	if transitionMinSize1 != transitionMinSize2 {
+		tflog.Debug(ctx, "Lifecycle config mismatch: transitionDefaultMinimumObjectSize differs", map[string]any{
+			"transitionMinSize1": string(transitionMinSize1),
+			"transitionMinSize2": string(transitionMinSize2),
+		})
 		return false
 	}
 
 	if len(rules1) != len(rules2) {
+		tflog.Debug(ctx, "Lifecycle config mismatch: rule count differs", map[string]any{
+			"rules1_count": len(rules1),
+			"rules2_count": len(rules2),
+		})
 		return false
 	}
 
-	for _, rule1 := range rules1 {
-		if !slices.ContainsFunc(rules2, func(rule2 awstypes.LifecycleRule) bool {
-			return reflect.DeepEqual(rule1, rule2)
-		}) {
+	for i, rule1 := range rules1 {
+		ruleID1 := ""
+		if rule1.ID != nil {
+			ruleID1 = *rule1.ID
+		}
+
+		tflog.Debug(ctx, "Checking rule from rules1", map[string]any{
+			"rule_index":  i,
+			"rule_id":     ruleID1,
+			"rule_status": string(rule1.Status),
+		})
+
+		foundMatch := false
+		for j, rule2 := range rules2 {
+			ruleID2 := ""
+			if rule2.ID != nil {
+				ruleID2 = *rule2.ID
+			}
+
+			if reflect.DeepEqual(rule1, rule2) {
+				tflog.Debug(ctx, "Found matching rule", map[string]any{
+					"rule1_index": i,
+					"rule1_id":    ruleID1,
+					"rule2_index": j,
+					"rule2_id":    ruleID2,
+				})
+				foundMatch = true
+				break
+			}
+
+			if ruleID1 == ruleID2 {
+				tflog.Debug(ctx, "Rule IDs match but content differs", map[string]any{
+					"rule_id":      ruleID1,
+					"rule1_index":  i,
+					"rule2_index":  j,
+					"rule1_status": string(rule1.Status),
+					"rule2_status": string(rule2.Status),
+				})
+
+				if rule1.Status != rule2.Status {
+					tflog.Debug(ctx, "Rule status differs", map[string]any{
+						"rule_id":      ruleID1,
+						"rule1_status": string(rule1.Status),
+						"rule2_status": string(rule2.Status),
+					})
+				}
+
+				if !reflect.DeepEqual(rule1.Filter, rule2.Filter) {
+					tflog.Debug(ctx, "Rule filter differs", map[string]any{
+						"rule_id":      ruleID1,
+						"rule1_filter": fmt.Sprintf("%+v", rule1.Filter),
+						"rule2_filter": fmt.Sprintf("%+v", rule2.Filter),
+					})
+				}
+
+				if !reflect.DeepEqual(rule1.Expiration, rule2.Expiration) {
+					tflog.Debug(ctx, "Rule expiration differs", map[string]any{
+						"rule_id":          ruleID1,
+						"rule1_expiration": fmt.Sprintf("%+v", rule1.Expiration),
+						"rule2_expiration": fmt.Sprintf("%+v", rule2.Expiration),
+					})
+				}
+
+				if !reflect.DeepEqual(rule1.Transitions, rule2.Transitions) {
+					tflog.Debug(ctx, "Rule transitions differ", map[string]any{
+						"rule_id":           ruleID1,
+						"rule1_transitions": fmt.Sprintf("%+v", rule1.Transitions),
+						"rule2_transitions": fmt.Sprintf("%+v", rule2.Transitions),
+					})
+				}
+
+				if !reflect.DeepEqual(rule1.NoncurrentVersionTransitions, rule2.NoncurrentVersionTransitions) {
+					tflog.Debug(ctx, "Rule noncurrent version transitions differ", map[string]any{
+						"rule_id":                          ruleID1,
+						"rule1_noncurrent_ver_transitions": fmt.Sprintf("%+v", rule1.NoncurrentVersionTransitions),
+						"rule2_noncurrent_ver_transitions": fmt.Sprintf("%+v", rule2.NoncurrentVersionTransitions),
+					})
+				}
+
+				if !reflect.DeepEqual(rule1.NoncurrentVersionExpiration, rule2.NoncurrentVersionExpiration) {
+					tflog.Debug(ctx, "Rule noncurrent version expiration differs", map[string]any{
+						"rule_id":                         ruleID1,
+						"rule1_noncurrent_ver_expiration": fmt.Sprintf("%+v", rule1.NoncurrentVersionExpiration),
+						"rule2_noncurrent_ver_expiration": fmt.Sprintf("%+v", rule2.NoncurrentVersionExpiration),
+					})
+				}
+
+				if !reflect.DeepEqual(rule1.AbortIncompleteMultipartUpload, rule2.AbortIncompleteMultipartUpload) {
+					tflog.Debug(ctx, "Rule abort incomplete multipart upload differs", map[string]any{
+						"rule_id":                    ruleID1,
+						"rule1_abort_incomplete_mpu": fmt.Sprintf("%+v", rule1.AbortIncompleteMultipartUpload),
+						"rule2_abort_incomplete_mpu": fmt.Sprintf("%+v", rule2.AbortIncompleteMultipartUpload),
+					})
+				}
+
+				if rule1.Prefix != rule2.Prefix {
+					prefix1 := ""
+					prefix2 := ""
+					if rule1.Prefix != nil {
+						prefix1 = *rule1.Prefix
+					}
+					if rule2.Prefix != nil {
+						prefix2 = *rule2.Prefix
+					}
+					tflog.Debug(ctx, "Rule prefix differs", map[string]any{
+						"rule_id":      ruleID1,
+						"rule1_prefix": prefix1,
+						"rule2_prefix": prefix2,
+					})
+				}
+			}
+		}
+
+		if !foundMatch {
+			tflog.Debug(ctx, "No matching rule found in rules2", map[string]any{
+				"rule_index":  i,
+				"rule_id":     ruleID1,
+				"rule_status": string(rule1.Status),
+				"rule_filter": fmt.Sprintf("%+v", rule1.Filter),
+			})
 			return false
 		}
 	}
 
+	tflog.Debug(ctx, "Lifecycle configurations are equal")
 	return true
 }
 
@@ -681,7 +841,7 @@ func statusLifecycleConfigEquals(ctx context.Context, conn *s3.Client, bucket, o
 			return nil, "", err
 		}
 
-		return output, strconv.FormatBool(lifecycleConfigEqual(output.TransitionDefaultMinimumObjectSize, output.Rules, transitionMinSize, rules)), nil
+		return output, strconv.FormatBool(lifecycleConfigEqual(ctx, output.TransitionDefaultMinimumObjectSize, output.Rules, transitionMinSize, rules)), nil
 	}
 }
 
